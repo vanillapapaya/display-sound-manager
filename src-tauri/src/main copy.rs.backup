@@ -1,0 +1,502 @@
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
+use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
+use tauri::{Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct DisplayInfo {
+    id: u32,
+    name: String,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    scale_factor: f64,
+    is_primary: bool,
+    rotation: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AudioDevice {
+    id: String,
+    name: String,
+    is_default: bool,
+    device_type: String, // "output" or "input"
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AudioSettings {
+    output_device: Option<String>,
+    input_device: Option<String>,
+    output_volume: u32,
+    input_volume: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct Profile {
+    id: String,
+    name: String,
+    displays: Vec<DisplayInfo>,
+    audio_settings: AudioSettings,
+    created_at: String,
+}
+
+struct AppState {
+    profiles: Mutex<Vec<Profile>>,
+}
+
+// 디스플레이 정보 가져오기
+#[tauri::command]
+async fn get_displays() -> Result<Vec<DisplayInfo>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        get_displays_windows()
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        get_displays_macos()
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        get_displays_linux()
+    }
+}
+
+// 오디오 장치 정보 가져오기
+#[tauri::command]
+async fn get_audio_devices() -> Result<Vec<AudioDevice>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        get_audio_devices_windows()
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        get_audio_devices_macos()
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        get_audio_devices_linux()
+    }
+}
+
+// 프로필 저장
+#[tauri::command]
+async fn save_profile(
+    state: tauri::State<'_, AppState>,
+    profile: Profile,
+) -> Result<(), String> {
+    let mut profiles = state.profiles.lock().unwrap();
+    
+    // 기존 프로필 업데이트 또는 새 프로필 추가
+    if let Some(pos) = profiles.iter().position(|p| p.id == profile.id) {
+        profiles[pos] = profile;
+    } else {
+        profiles.push(profile);
+    }
+    
+    // 파일에 저장
+    save_profiles_to_file(&profiles)?;
+    Ok(())
+}
+
+// 프로필 목록 가져오기
+#[tauri::command]
+async fn get_profiles(state: tauri::State<'_, AppState>) -> Result<Vec<Profile>, String> {
+    let profiles = state.profiles.lock().unwrap();
+    Ok(profiles.clone())
+}
+
+// 프로필 삭제
+#[tauri::command]
+async fn delete_profile(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+) -> Result<(), String> {
+    let mut profiles = state.profiles.lock().unwrap();
+    profiles.retain(|p| p.id != profile_id);
+    save_profiles_to_file(&profiles)?;
+    Ok(())
+}
+
+// 프로필 적용
+#[tauri::command]
+async fn apply_profile(
+    state: tauri::State<'_, AppState>,
+    profile_id: String,
+) -> Result<(), String> {
+    let profiles = state.profiles.lock().unwrap();
+    
+    if let Some(profile) = profiles.iter().find(|p| p.id == profile_id) {
+        // 디스플레이 설정 적용
+        apply_display_settings(&profile.displays)?;
+        
+        // 오디오 설정 적용
+        apply_audio_settings(&profile.audio_settings)?;
+        
+        Ok(())
+    } else {
+        Err("프로필을 찾을 수 없습니다.".to_string())
+    }
+}
+
+// Windows 구현
+#[cfg(target_os = "windows")]
+mod windows_impl {
+    use super::*;
+    use windows::Win32::Devices::Display::*;
+    use windows::Win32::Foundation::*;
+    use windows::Win32::Graphics::Gdi::*;
+    
+    pub fn get_displays_windows() -> Result<Vec<DisplayInfo>, String> {
+        let mut displays = Vec::new();
+        let mut device_num = 0;
+        
+        unsafe {
+            loop {
+                let mut display_device = DISPLAY_DEVICEW {
+                    cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                    ..Default::default()
+                };
+                
+                if !EnumDisplayDevicesW(
+                    PCWSTR::null(),
+                    device_num,
+                    &mut display_device,
+                    0,
+                ).as_bool() {
+                    break;
+                }
+                
+                if display_device.StateFlags & DISPLAY_DEVICE_ACTIVE != 0 {
+                    let mut dev_mode = DEVMODEW {
+                        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+                        ..Default::default()
+                    };
+                    
+                    if EnumDisplaySettingsW(
+                        PCWSTR(display_device.DeviceName.as_ptr()),
+                        ENUM_CURRENT_SETTINGS,
+                        &mut dev_mode,
+                    ).as_bool() {
+                        displays.push(DisplayInfo {
+                            id: device_num,
+                            name: String::from_utf16_lossy(&display_device.DeviceName)
+                                .trim_end_matches('\0')
+                                .to_string(),
+                            width: dev_mode.dmPelsWidth,
+                            height: dev_mode.dmPelsHeight,
+                            x: dev_mode.Anonymous1.Anonymous2.dmPosition.x,
+                            y: dev_mode.Anonymous1.Anonymous2.dmPosition.y,
+                            scale_factor: 1.0, // TODO: Get actual scale factor
+                            is_primary: display_device.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE != 0,
+                            rotation: dev_mode.Anonymous1.Anonymous2.dmDisplayOrientation,
+                        });
+                    }
+                }
+                
+                device_num += 1;
+            }
+        }
+        
+        Ok(displays)
+    }
+    
+    pub fn get_audio_devices_windows() -> Result<Vec<AudioDevice>, String> {
+        // Windows Core Audio API 구현
+        let mut devices = Vec::new();
+        
+        // 임시 구현 - 실제로는 Windows Core Audio API 사용
+        devices.push(AudioDevice {
+            id: "default".to_string(),
+            name: "기본 스피커".to_string(),
+            is_default: true,
+            device_type: "output".to_string(),
+        });
+        
+        Ok(devices)
+    }
+}
+
+#[cfg(target_os = "windows")]
+use windows_impl::*;
+
+// macOS 구현
+#[cfg(target_os = "macos")]
+mod macos_impl {
+    use super::*;
+    use core_graphics::display::*;
+    
+    pub fn get_displays_macos() -> Result<Vec<DisplayInfo>, String> {
+        let displays = CGDisplay::active_displays()
+            .map_err(|e| format!("디스플레이 정보 가져오기 실패: {:?}", e))?;
+        
+        Ok(displays
+            .into_iter()
+            .map(|id| {
+                let display = CGDisplay::new(id);
+                let bounds = display.bounds();
+                
+                DisplayInfo {
+                    id: id,
+                    name: format!("Display {}", id),
+                    width: bounds.size.width as u32,
+                    height: bounds.size.height as u32,
+                    x: bounds.origin.x as i32,
+                    y: bounds.origin.y as i32,
+                    scale_factor: 1.0, // TODO: Get actual scale
+                    is_primary: display.is_main(),
+                    rotation: 0, // TODO: Get rotation
+                }
+            })
+            .collect())
+    }
+    
+    pub fn get_audio_devices_macos() -> Result<Vec<AudioDevice>, String> {
+        // Core Audio 구현
+        Ok(vec![])
+    }
+}
+
+#[cfg(target_os = "macos")]
+use macos_impl::*;
+
+// Linux 구현
+#[cfg(target_os = "linux")]
+mod linux_impl {
+    use super::*;
+    use std::process::Command;
+    
+    pub fn get_displays_linux() -> Result<Vec<DisplayInfo>, String> {
+        // xrandr를 사용한 구현
+        let output = Command::new("xrandr")
+            .arg("--query")
+            .output()
+            .map_err(|e| format!("xrandr 실행 실패: {}", e))?;
+        
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut displays = Vec::new();
+        
+        // xrandr 출력 파싱 (간단한 구현)
+        for (i, line) in stdout.lines().enumerate() {
+            if line.contains(" connected") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    displays.push(DisplayInfo {
+                        id: i as u32,
+                        name: parts[0].to_string(),
+                        width: 1920, // TODO: 실제 파싱
+                        height: 1080,
+                        x: 0,
+                        y: 0,
+                        scale_factor: 1.0,
+                        is_primary: line.contains("primary"),
+                        rotation: 0,
+                    });
+                }
+            }
+        }
+        
+        Ok(displays)
+    }
+    
+    pub fn get_audio_devices_linux() -> Result<Vec<AudioDevice>, String> {
+        // PulseAudio 또는 ALSA 구현
+        Ok(vec![])
+    }
+}
+
+#[cfg(target_os = "linux")]
+use linux_impl::*;
+
+// 공통 함수들
+fn save_profiles_to_file(profiles: &[Profile]) -> Result<(), String> {
+    let app_dir = tauri::api::path::app_data_dir(&tauri::Config::default())
+        .ok_or_else(|| "앱 데이터 디렉토리를 찾을 수 없습니다.".to_string())?;
+    
+    std::fs::create_dir_all(&app_dir)
+        .map_err(|e| format!("디렉토리 생성 실패: {}", e))?;
+    
+    let profiles_path = app_dir.join("profiles.json");
+    let json = serde_json::to_string_pretty(profiles)
+        .map_err(|e| format!("JSON 직렬화 실패: {}", e))?;
+    
+    std::fs::write(profiles_path, json)
+        .map_err(|e| format!("파일 저장 실패: {}", e))?;
+    
+    Ok(())
+}
+
+fn load_profiles_from_file() -> Result<Vec<Profile>, String> {
+    let app_dir = tauri::api::path::app_data_dir(&tauri::Config::default())
+        .ok_or_else(|| "앱 데이터 디렉토리를 찾을 수 없습니다.".to_string())?;
+    
+    let profiles_path = app_dir.join("profiles.json");
+    
+    if !profiles_path.exists() {
+        return Ok(Vec::new());
+    }
+    
+    let json = std::fs::read_to_string(profiles_path)
+        .map_err(|e| format!("파일 읽기 실패: {}", e))?;
+    
+    serde_json::from_str(&json)
+        .map_err(|e| format!("JSON 파싱 실패: {}", e))
+}
+
+fn apply_display_settings(displays: &[DisplayInfo]) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        // Windows API를 사용한 디스플레이 설정 변경
+        for display in displays {
+            // ChangeDisplaySettingsEx 사용
+        }
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        // macOS 디스플레이 설정 변경
+        use std::process::Command;
+        Command::new("displayplacer")
+            .args(&["list"]) // 실제 설정 명령
+            .output()
+            .map_err(|e| format!("displayplacer 실행 실패: {}", e))?;
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        // xrandr을 사용한 설정 변경
+        use std::process::Command;
+        for display in displays {
+            Command::new("xrandr")
+                .args(&[
+                    "--output",
+                    &display.name,
+                    "--mode",
+                    &format!("{}x{}", display.width, display.height),
+                    "--pos",
+                    &format!("{}x{}", display.x, display.y),
+                ])
+                .output()
+                .map_err(|e| format!("xrandr 실행 실패: {}", e))?;
+        }
+    }
+    
+    Ok(())
+}
+
+fn apply_audio_settings(audio: &AudioSettings) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(device) = &audio.output_device {
+            // nircmd 또는 Windows API 사용
+            use std::process::Command;
+            Command::new("nircmd")
+                .args(&["setdefaultsounddevice", device])
+                .output()
+                .map_err(|e| format!("오디오 설정 실패: {}", e))?;
+        }
+    }
+    
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(device) = &audio.output_device {
+            use std::process::Command;
+            Command::new("SwitchAudioSource")
+                .args(&["-s", device])
+                .output()
+                .map_err(|e| format!("오디오 설정 실패: {}", e))?;
+        }
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(device) = &audio.output_device {
+            use std::process::Command;
+            Command::new("pactl")
+                .args(&["set-default-sink", device])
+                .output()
+                .map_err(|e| format!("오디오 설정 실패: {}", e))?;
+        }
+    }
+    
+    Ok(())
+}
+
+fn main() {
+    // 저장된 프로필 로드
+    let profiles = load_profiles_from_file().unwrap_or_default();
+    
+    // 시스템 트레이 메뉴 생성
+    let tray_menu = SystemTrayMenu::new()
+        .add_item(SystemTrayMenuItem::new("열기".to_string(), "open".to_string()))
+        .add_native_item(SystemTrayMenuItem::Separator);
+    
+    // 프로필 메뉴 추가
+    let tray_menu = profiles.iter().fold(tray_menu, |menu, profile| {
+        menu.add_item(SystemTrayMenuItem::new(
+            profile.name.clone(),
+            format!("profile:{}", profile.id),
+        ))
+    });
+    
+    let tray_menu = tray_menu
+        .add_native_item(SystemTrayMenuItem::Separator)
+        .add_item(SystemTrayMenuItem::new("종료".to_string(), "quit".to_string()));
+    
+    let system_tray = SystemTray::new().with_menu(tray_menu);
+    
+    tauri::Builder::default()
+        .manage(AppState {
+            profiles: Mutex::new(profiles),
+        })
+        .system_tray(system_tray)
+        .on_system_tray_event(|app, event| match event {
+            SystemTrayEvent::LeftClick { .. } => {
+                let window = app.get_window("main").unwrap();
+                window.show().unwrap();
+                window.set_focus().unwrap();
+            }
+            SystemTrayEvent::MenuItemClick { id, .. } => {
+                match id.as_str() {
+                    "open" => {
+                        let window = app.get_window("main").unwrap();
+                        window.show().unwrap();
+                    }
+                    "quit" => {
+                        std::process::exit(0);
+                    }
+                    s if s.starts_with("profile:") => {
+                        let profile_id = s.strip_prefix("profile:").unwrap();
+                        // 프로필 적용
+                        let state = app.state::<AppState>();
+                        let profiles = state.profiles.lock().unwrap();
+                        if let Some(profile) = profiles.iter().find(|p| p.id == profile_id) {
+                            let _ = apply_display_settings(&profile.displays);
+                            let _ = apply_audio_settings(&profile.audio_settings);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_displays,
+            get_audio_devices,
+            save_profile,
+            get_profiles,
+            delete_profile,
+            apply_profile,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
