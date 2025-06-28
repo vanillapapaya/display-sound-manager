@@ -16,11 +16,12 @@ use core_graphics::display::{CGDirectDisplayID, CGDisplayBounds, CGGetActiveDisp
 
 #[cfg(target_os = "windows")]
 use winapi::um::winuser::{
-    EnumDisplayMonitors, GetMonitorInfoW, MONITORINFO, HDC, HMONITOR, LPARAM, LPRECT,
-    GetSystemMetrics, SM_CMONITORS
+    EnumDisplayMonitors, GetMonitorInfoW, MONITORINFO
 };
 #[cfg(target_os = "windows")]
-use winapi::shared::windef::{RECT, HWND};
+use winapi::shared::windef::{HDC, HMONITOR, LPRECT, RECT, HWND};
+#[cfg(target_os = "windows")]
+use winapi::shared::minwindef::LPARAM;
 #[cfg(target_os = "windows")]
 use std::ptr;
 #[cfg(target_os = "windows")]
@@ -325,7 +326,7 @@ fn get_audio_devices_windows() -> Result<Vec<AudioDevice>, String> {
     {
         Ok(output) => {
             if output.status.success() {
-                let output_str = String::from_utf8_lossy(&output.stdout);
+                let _output_str = String::from_utf8_lossy(&output.stdout);
                 // JSON 파싱이 복잡하므로 간단한 텍스트 파싱 사용
                 devices.push(AudioDevice {
                     id: "default_output".to_string(),
@@ -496,7 +497,7 @@ fn apply_display_settings_macos(displays: &[DisplayInfo]) -> Result<(), String> 
 }
 
 #[cfg(target_os = "windows")]
-fn apply_display_settings_windows(displays: &[DisplayInfo]) -> Result<(), String> {
+fn apply_display_settings_windows(_displays: &[DisplayInfo]) -> Result<(), String> {
     // Windows에서는 nircmd 또는 PowerShell을 사용해서 디스플레이 설정 변경
     // 복잡한 디스플레이 설정은 Windows API가 필요하므로 간단한 구현만 제공
     
