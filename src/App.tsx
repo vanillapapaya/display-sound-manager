@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { invoke } from '@tauri-apps/api/tauri';
-import { appWindow } from '@tauri-apps/api/window';
+import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import './App.css';
 
 interface DisplayInfo {
@@ -49,7 +49,7 @@ function App() {
     loadProfiles();
     
     // 창 표시
-    appWindow.show();
+    getCurrentWindow().show();
   }, []);
 
   const loadSystemInfo = async () => {
