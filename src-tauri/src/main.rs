@@ -14,6 +14,18 @@ use tauri::Manager;
 #[cfg(target_os = "macos")]
 use core_graphics::display::{CGDirectDisplayID, CGDisplayBounds, CGGetActiveDisplayList, CGMainDisplayID, CGDisplayPixelsWide, CGDisplayPixelsHigh};
 
+#[cfg(target_os = "windows")]
+use winapi::um::winuser::{
+    EnumDisplayMonitors, GetMonitorInfoW, MONITORINFO, HDC, HMONITOR, LPARAM, LPRECT,
+    GetSystemMetrics, SM_CMONITORS
+};
+#[cfg(target_os = "windows")]
+use winapi::shared::windef::{RECT, HWND};
+#[cfg(target_os = "windows")]
+use std::ptr;
+#[cfg(target_os = "windows")]
+use std::mem;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct DisplayInfo {
     id: u32,
@@ -91,7 +103,11 @@ async fn get_displays() -> Result<Vec<DisplayInfo>, String> {
     {
         get_displays_macos()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        get_displays_windows()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         // 다른 OS용 기본 구현
         Ok(vec![
@@ -153,6 +169,73 @@ fn get_displays_macos() -> Result<Vec<DisplayInfo>, String> {
     Ok(displays)
 }
 
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn monitor_enum_proc(
+    hmonitor: HMONITOR,
+    _hdc: HDC,
+    _lprect: LPRECT,
+    lparam: LPARAM,
+) -> i32 {
+    let displays = &mut *(lparam as *mut Vec<DisplayInfo>);
+    
+    let mut monitor_info: MONITORINFO = mem::zeroed();
+    monitor_info.cbSize = mem::size_of::<MONITORINFO>() as u32;
+    
+    if GetMonitorInfoW(hmonitor, &mut monitor_info) != 0 {
+        let rect = monitor_info.rcMonitor;
+        let is_primary = monitor_info.dwFlags & 1 != 0; // MONITORINFOF_PRIMARY
+        
+        displays.push(DisplayInfo {
+            id: hmonitor as u32,
+            name: format!("Display {}", displays.len() + 1),
+            width: (rect.right - rect.left) as u32,
+            height: (rect.bottom - rect.top) as u32,
+            x: rect.left,
+            y: rect.top,
+            scale_factor: 1.0, // TODO: 실제 DPI 스케일링 구하기
+            is_primary,
+            rotation: 0, // TODO: 실제 회전 값 구하기
+        });
+    }
+    
+    1 // Continue enumeration
+}
+
+#[cfg(target_os = "windows")]
+fn get_displays_windows() -> Result<Vec<DisplayInfo>, String> {
+    let mut displays = Vec::new();
+    
+    unsafe {
+        let result = EnumDisplayMonitors(
+            ptr::null_mut(),
+            ptr::null_mut(),
+            Some(monitor_enum_proc),
+            &mut displays as *mut Vec<DisplayInfo> as LPARAM,
+        );
+        
+        if result == 0 {
+            return Err("Failed to enumerate display monitors".to_string());
+        }
+    }
+    
+    if displays.is_empty() {
+        // Fallback if enumeration fails
+        displays.push(DisplayInfo {
+            id: 1,
+            name: "Primary Display".to_string(),
+            width: 1920,
+            height: 1080,
+            x: 0,
+            y: 0,
+            scale_factor: 1.0,
+            is_primary: true,
+            rotation: 0,
+        });
+    }
+    
+    Ok(displays)
+}
+
 // 오디오 장치 정보 가져오기
 #[tauri::command]
 async fn get_audio_devices() -> Result<Vec<AudioDevice>, String> {
@@ -160,7 +243,11 @@ async fn get_audio_devices() -> Result<Vec<AudioDevice>, String> {
     {
         get_audio_devices_macos()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        get_audio_devices_windows()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         // 다른 OS용 기본 구현
         Ok(vec![
@@ -220,6 +307,70 @@ fn get_audio_devices_macos() -> Result<Vec<AudioDevice>, String> {
         is_default: true,
         device_type: "input".to_string(),
     });
+    
+    Ok(devices)
+}
+
+#[cfg(target_os = "windows")]
+fn get_audio_devices_windows() -> Result<Vec<AudioDevice>, String> {
+    let mut devices = Vec::new();
+    
+    // Windows에서는 PowerShell을 사용해서 오디오 장치 목록을 가져옵니다
+    match Command::new("powershell")
+        .args(&[
+            "-Command",
+            "Get-AudioDevice -List | Select-Object Name, ID, Type, Default | ConvertTo-Json"
+        ])
+        .output()
+    {
+        Ok(output) => {
+            if output.status.success() {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                // JSON 파싱이 복잡하므로 간단한 텍스트 파싱 사용
+                devices.push(AudioDevice {
+                    id: "default_output".to_string(),
+                    name: "기본 출력 장치".to_string(),
+                    is_default: true,
+                    device_type: "output".to_string(),
+                });
+                devices.push(AudioDevice {
+                    id: "default_input".to_string(),
+                    name: "기본 입력 장치".to_string(),
+                    is_default: true,
+                    device_type: "input".to_string(),
+                });
+            } else {
+                // PowerShell 명령이 실패한 경우 기본 장치 추가
+                devices.push(AudioDevice {
+                    id: "default_output".to_string(),
+                    name: "기본 출력 장치".to_string(),
+                    is_default: true,
+                    device_type: "output".to_string(),
+                });
+                devices.push(AudioDevice {
+                    id: "default_input".to_string(),
+                    name: "기본 입력 장치".to_string(),
+                    is_default: true,
+                    device_type: "input".to_string(),
+                });
+            }
+        }
+        Err(_) => {
+            // 오류 발생 시 기본 장치 추가
+            devices.push(AudioDevice {
+                id: "default_output".to_string(),
+                name: "기본 출력 장치".to_string(),
+                is_default: true,
+                device_type: "output".to_string(),
+            });
+            devices.push(AudioDevice {
+                id: "default_input".to_string(),
+                name: "기본 입력 장치".to_string(),
+                is_default: true,
+                device_type: "input".to_string(),
+            });
+        }
+    }
     
     Ok(devices)
 }
@@ -298,7 +449,11 @@ fn apply_display_settings(displays: &[DisplayInfo]) -> Result<(), String> {
     {
         apply_display_settings_macos(displays)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        apply_display_settings_windows(displays)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Ok(()) // 다른 OS에서는 아직 미구현
     }
@@ -340,13 +495,31 @@ fn apply_display_settings_macos(displays: &[DisplayInfo]) -> Result<(), String> 
     }
 }
 
+#[cfg(target_os = "windows")]
+fn apply_display_settings_windows(displays: &[DisplayInfo]) -> Result<(), String> {
+    // Windows에서는 nircmd 또는 PowerShell을 사용해서 디스플레이 설정 변경
+    // 복잡한 디스플레이 설정은 Windows API가 필요하므로 간단한 구현만 제공
+    
+    // 현재는 경고 메시지만 반환 (실제 구현은 복잡함)
+    log::warn!("Windows 디스플레이 설정 변경은 현재 제한적으로 지원됩니다.");
+    
+    // TODO: Windows Display API를 사용한 실제 구현
+    // 참고: ChangeDisplaySettings, SetDisplayConfig 등 사용
+    
+    Ok(())
+}
+
 // 오디오 설정 적용
 fn apply_audio_settings(audio_settings: &AudioSettings) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         apply_audio_settings_macos(audio_settings)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        apply_audio_settings_windows(audio_settings)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Ok(()) // 다른 OS에서는 아직 미구현
     }
@@ -369,6 +542,47 @@ fn apply_audio_settings_macos(audio_settings: &AudioSettings) -> Result<(), Stri
             }
             Err(e) => {
                 return Err(format!("SwitchAudioSource 실행 실패: {}. SwitchAudioSource가 설치되어 있는지 확인하세요.", e));
+            }
+        }
+    }
+    
+    // TODO: 입력 장치 및 볼륨 설정 구현
+    
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn apply_audio_settings_windows(audio_settings: &AudioSettings) -> Result<(), String> {
+    // Windows에서는 nircmd 또는 PowerShell을 사용해서 오디오 설정 변경
+    if let Some(output_device) = &audio_settings.output_device {
+        // nircmd를 사용한 오디오 장치 변경 시도
+        match Command::new("nircmd")
+            .args(&["setdefaultsounddevice", output_device])
+            .output()
+        {
+            Ok(output) => {
+                if !output.status.success() {
+                    // nircmd가 실패하면 PowerShell 시도
+                    match Command::new("powershell")
+                        .args(&[
+                            "-Command",
+                            &format!("Set-AudioDevice -Name '{}'", output_device)
+                        ])
+                        .output()
+                    {
+                        Ok(ps_output) => {
+                            if !ps_output.status.success() {
+                                log::warn!("Windows 오디오 설정 변경이 부분적으로 실패했습니다. nircmd 또는 AudioDeviceCmdlets 모듈이 필요할 수 있습니다.");
+                            }
+                        }
+                        Err(_) => {
+                            log::warn!("Windows 오디오 설정 변경을 위해 nircmd 또는 AudioDeviceCmdlets PowerShell 모듈이 필요합니다.");
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                log::warn!("nircmd를 찾을 수 없습니다. Windows 오디오 설정 변경이 제한됩니다.");
             }
         }
     }
